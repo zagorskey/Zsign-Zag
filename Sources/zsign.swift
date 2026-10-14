@@ -8,6 +8,26 @@
 import Zsign
 
 public enum Zsign {
+
+    /// Apple Security basic X.509 policy, not installation authorization.
+    static public func inspectAppleSecurityTrust(cms: Data) -> String {
+        ZagInspectAppleSecurityTrust(cms)
+    }
+
+    /// Read-only X.509 chain check; does not establish installation authorization.
+    static public func inspectCMSCertificateChain(cms: Data) -> String {
+        ZagInspectCMSCertificateChain(cms)
+    }
+
+    /// Experimental cryptographic CMS check. Does not establish trust.
+    static public func verifyDetachedCMS(
+        cms: Data,
+        codeDirectory: Data
+    ) -> String {
+        ZagVerifyDetachedCMS(cms, codeDirectory)
+    }
+
+
 	/// Checks if the MachO-file is properly signed
 	/// - Parameter appExecutable: Executable
 	/// - Returns: True if its signed
@@ -70,6 +90,7 @@ public enum Zsign {
 		customVersion: String = "",
 		adhoc: Bool = false,
 		removeProvision: Bool = false,
+		sha256Only: Bool = false,
 		completion: ((Bool, Error?) -> Void)? = nil
 	) -> Bool {
 		if zsign(
@@ -83,6 +104,7 @@ public enum Zsign {
 			customVersion,
 			adhoc,
 			removeProvision,
+			sha256Only,
 			completion.map { callback in
 				{ success, error in
 					callback(success, error)

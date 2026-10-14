@@ -11,9 +11,16 @@
 #include <stdio.h>
 #import <Foundation/Foundation.h>
 
+
+
+
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+NSString *ZagInspectAppleSecurityTrust(NSData *cmsDER);
+NSString *ZagInspectCMSCertificateChain(NSData *cmsDER);
+NSString *ZagVerifyDetachedCMS(NSData *cmsDER, NSData *codeDirectory);
 
 bool CheckIfSigned(NSString *filePath);
 bool InjectDyLib(NSString *filePath, NSString *dylibPath, bool weakInject);
@@ -32,6 +39,7 @@ int zsign(
 	NSString *bundleversion,
 	bool adhoc,
 	bool dontGenerateEmbeddedMobileProvision,
+	bool sha256Only,
 	void(^completionHandler)(BOOL success, NSError *error)
 );
 

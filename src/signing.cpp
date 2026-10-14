@@ -604,12 +604,18 @@ bool ZSign::SlotBuildCMSSignature(ZSignAsset* pSignAsset,
 	string strCDHashesPlist;
 	string strCodeDirectorySlotSHA1;
 	string strAltnateCodeDirectorySlot256;
-	ZSHA::SHA1(strCodeDirectorySlot, strCodeDirectorySlotSHA1);
-	ZSHA::SHA256(strAltnateCodeDirectorySlot, strAltnateCodeDirectorySlot256);
-
-	size_t cdHashSize = strCodeDirectorySlotSHA1.size();
-	jvHashes["cdhashes"][0].assign_data(strCodeDirectorySlotSHA1.data(), cdHashSize);
-	jvHashes["cdhashes"][1].assign_data(strAltnateCodeDirectorySlot256.data(), cdHashSize);
+	if (pSignAsset->m_bSHA256Only) {
+		// The primary CodeDirectory is SHA-256; there is no alternate.
+		ZSHA::SHA256(strCodeDirectorySlot, strAltnateCodeDirectorySlot256);
+		// Apple's cdhash list uses the first 20 bytes of SHA-256.
+		jvHashes["cdhashes"][0].assign_data(strAltnateCodeDirectorySlot256.data(), 20);
+	} else {
+		ZSHA::SHA1(strCodeDirectorySlot, strCodeDirectorySlotSHA1);
+		ZSHA::SHA256(strAltnateCodeDirectorySlot, strAltnateCodeDirectorySlot256);
+		size_t cdHashSize = strCodeDirectorySlotSHA1.size();
+		jvHashes["cdhashes"][0].assign_data(strCodeDirectorySlotSHA1.data(), cdHashSize);
+		jvHashes["cdhashes"][1].assign_data(strAltnateCodeDirectorySlot256.data(), cdHashSize);
+	}
 	jvHashes.style_write_plist(strCDHashesPlist);
 
 	string strCMSData;
