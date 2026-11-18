@@ -459,9 +459,13 @@ bool CheckComponent(const string& name, const ZSignAsset& asset, const string& b
 		}
 	}
 	// Groups the entitlements name must belong to this team or be app groups.
+	// The one exception is com.apple.token, Apple's shared CryptoTokenKit
+	// group, which Apple's own profiles list next to TEAM.*; like every value,
+	// it is allowed only when the profile lists it (checked above).
 	const jvalue& keychain = entitlements["keychain-access-groups"];
 	for (size_t i = 0; keychain.is_array() && i < keychain.size(); i++) {
-		if (string(keychain.at(i).as_cstr()).rfind(asset.m_strTeamId + ".", 0) != 0) {
+		const string group = keychain.at(i).as_cstr();
+		if (group != "com.apple.token" && group.rfind(asset.m_strTeamId + ".", 0) != 0) {
 			strError = name + ": a keychain access group belongs to another team";
 			return false;
 		}

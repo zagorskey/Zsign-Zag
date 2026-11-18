@@ -345,6 +345,13 @@ func securitySigner(_ keyFile: String, calls: UnsafeMutablePointer<Int>) -> (Dat
 		refused(main(["keychain-access-groups": "*"], ["keychain-access-groups": ["OTHERTEAM1.\(appID)"]]),
 				"belongs to another team", "a keychain group of another team is refused even when the profile allows any")
 		signs(main([:], ["keychain-access-groups": ["\(team).\(appID)", "\(team).com.example.shared"]]), "keychain groups within the team are allowed")
+		// Apple's profiles list com.apple.token next to TEAM.* (found with a real AppTesters profile).
+		signs(main(["keychain-access-groups": ["\(team).*", "com.apple.token"]], ["keychain-access-groups": ["\(team).*", "com.apple.token"]]),
+			  "com.apple.token is allowed when the profile lists it")
+		refused(main([:], ["keychain-access-groups": ["\(team).\(appID)", "com.apple.token"]]),
+				"value of keychain-access-groups", "com.apple.token is refused when the profile does not list it")
+		refused(main(["keychain-access-groups": "*"], ["keychain-access-groups": ["com.apple.token2"]]),
+				"belongs to another team", "only the exact com.apple.token is exempt")
 		refused(main(["get-task-allow": false], ["get-task-allow": true]), "value of get-task-allow", "get-task-allow cannot be true when the profile's is false")
 		signs(main([:], ["get-task-allow": false]), "get-task-allow may be false when the profile's is true")
 		refused(main(["aps-environment": "development"], ["aps-environment": "production"]), "value of aps-environment", "a push environment other than the profile's is refused")
