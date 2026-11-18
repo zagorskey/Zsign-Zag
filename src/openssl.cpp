@@ -661,10 +661,11 @@ bool ZSignAsset::Init(
 	m_evpPKey = evpPKey;
 	m_x509Cert = x509Cert;
 
-	string strChainError;
-	if (!SelectChain(strChainError)) {
-		ZLog::ErrorV(">>> %s\n", strChainError.c_str());
-		return false;
+	// Without a verified Apple chain no signature can be made. That is
+	// reported by the signing entry point (zsign), not here, so callers that
+	// only inspect a certificate (checkCert) behave as before.
+	if (!SelectChain(m_strChainError)) {
+		ZLog::ErrorV(">>> %s\n", m_strChainError.c_str());
 	}
 	return true;
 }
@@ -761,6 +762,17 @@ bool ZSignAsset::SelectChain(string& strError)
 			strError = "The signing certificate has expired.";
 			return false;
 		}
+		// The issuer must be a certificate authority, valid now.
+		if (X509_check_ca(chosen) < 1) {
+			X509_free(chosen);
+			strError = "The signing certificate's issuer is not a certificate authority.";
+			return false;
+		}
+		if (X509_cmp_current_time(X509_get0_notBefore(chosen)) >= 0 || X509_cmp_current_time(X509_get0_notAfter(chosen)) <= 0) {
+			X509_free(chosen);
+			strError = "The signing certificate's issuer is not valid now.";
+			return false;
+		}
 		if ((X509_get_extension_flags(cert) & EXFLAG_XKUSAGE) && !(X509_get_extended_key_usage(cert) & XKU_CODE_SIGN)) {
 			X509_free(chosen);
 			strError = "The signing certificate does not allow code signing.";
@@ -850,7 +862,7 @@ static bool ZagProfileContains(const jvalue& jvProv, X509* cert)
 static bool ZagReadProfile(const string& strProvData, jvalue& jvProv, string& strTeamId, string& strError)
 {
 	string strContent;
-	if (!ZSignAsset::GetCMSContent(strProvData, strContent) || !jvProv.read_plist(strContent)) {
+	if (!ZSignAsset::GetCMSContent(strProvData, strContent) || !jvProv.read_plist(strContent) || !jvProv.is_object()) {
 		strError = "The provisioning profile cannot be read.";
 		return false;
 	}

@@ -36,7 +36,8 @@ func plist(_ value: Any) -> Data { try! PropertyListSerialization.data(fromPrope
 
 /// A profile signed (CMS) by the test authority, as Apple signs real ones.
 func profile(bundle: String, team profileTeam: String = team, certificates: [Data] = [data("good.der")],
-			 entitlements extra: [String: Any] = [:], expires: Date = Date(timeIntervalSinceNow: 7 * 86_400)) -> Data {
+			 entitlements extra: [String: Any] = [:], expires: Date = Date(timeIntervalSinceNow: 7 * 86_400),
+			 edit: (inout [String: Any]) -> Void = { _ in }) -> Data {
 	var entitlements: [String: Any] = [
 		"application-identifier": "\(profileTeam).\(bundle)",
 		"com.apple.developer.team-identifier": profileTeam,
@@ -44,13 +45,19 @@ func profile(bundle: String, team profileTeam: String = team, certificates: [Dat
 		"keychain-access-groups": ["\(profileTeam).*"]
 	]
 	entitlements.merge(extra) { $1 }
-	let body: [String: Any] = [
+	var body: [String: Any] = [
 		"AppIDName": bundle, "TeamIdentifier": [profileTeam], "TeamName": "Zag Test", "Name": bundle,
 		"UUID": UUID().uuidString, "CreationDate": Date(), "ExpirationDate": expires, "Version": 1,
 		"DeveloperCertificates": certificates, "Entitlements": entitlements, "ProvisionedDevices": ["00000000-0000000000000000"]
 	]
+	edit(&body)
+	return cmsSigned(plist(body))
+}
+
+/// Content signed (CMS) by the test authority, as Apple signs profiles.
+func cmsSigned(_ content: Data) -> Data {
 	let input = work.appendingPathComponent("p-\(UUID().uuidString).plist"), output = work.appendingPathComponent("p-\(UUID().uuidString).der")
-	try! plist(body).write(to: input)
+	try! content.write(to: input)
 	let result = run(openssl, ["cms", "-sign", "-nodetach", "-binary", "-outform", "DER", "-signer", pki.appendingPathComponent("test.pem").path,
 							   "-inkey", pki.appendingPathComponent("test.key").path, "-in", input.path, "-out", output.path])
 	precondition(result.status == 0, result.output)
@@ -189,6 +196,7 @@ func securitySigner(_ keyFile: String, calls: UnsafeMutablePointer<Int>) -> (Dat
 		rawSigner()
 		identities()
 		componentChecks()
+		entitlementValues()
 		structure()
 		malformed()
 		print("SUCCESS: \(passed) strict signing checks passed")
@@ -269,6 +277,15 @@ func securitySigner(_ keyFile: String, calls: UnsafeMutablePointer<Int>) -> (Dat
 		check(sign(makeApp(), parts, key: data("other.key"))?.contains("not for this key") == true, "a key that is not the certificate's is refused")
 		check(sign(makeApp(), parts, certificate: nil) == nil, "with a key only, the profile's certificate for it is used")
 		check(sign(makeApp(), parts, key: Data("not a key".utf8))?.contains("cannot be read") == true, "unreadable key data is refused")
+		func chain(_ name: String, _ intermediates: [Data], _ text: String, _ label: String) {
+			let app = makeApp(widget: false), before = snapshot(app)
+			let error = sign(app, ["": (profile(bundle: appID, certificates: [data("\(name).der")]), entitlements(appID))],
+							 certificate: data("\(name).der"), key: data("\(name).key"), intermediates: intermediates) ?? ""
+			check(error.contains(text) && snapshot(app) == before, label + " (nothing is changed)")
+		}
+		chain("notca", [intermediate, data("good.der")], "not issued by a supported Apple", "a certificate issued by a non-authority certificate is refused")
+		chain("underold", [data("oldca.der")], "issuer is not valid now", "a certificate under an expired intermediate is refused")
+		chain("selfsigned", [data("selfsigned.der")], "not issued by a supported Apple", "a self-signed certificate offered as its own issuer is refused")
 	}
 
 	static func componentChecks() {
@@ -302,6 +319,68 @@ func securitySigner(_ keyFile: String, calls: UnsafeMutablePointer<Int>) -> (Dat
 		refused(parts, "not an extension in this app", "a profile for an extension that is not there is refused")
 	}
 
+	/// Entitlement values, checked against the profile's as iOS checks them.
+	static func entitlementValues() {
+		func signs(_ parts: Components, _ label: String) {
+			let app = makeApp(widget: parts["PlugIns/Widget.appex"] != nil)
+			check(sign(app, parts) == nil && Zsign.verifyComponents(appPath: app.path, certificate: data("good.der"), components: parts) == nil, label)
+		}
+		func refused(_ parts: Components, _ text: String, _ label: String) {
+			let app = makeApp(widget: parts["PlugIns/Widget.appex"] != nil), before = snapshot(app)
+			let error = sign(app, parts) ?? ""
+			check(error.contains(text) && snapshot(app) == before, label + " (nothing is changed)")
+		}
+		func main(_ allowed: [String: Any], _ used: [String: Any]) -> Components {
+			["": (profile(bundle: appID, entitlements: allowed), entitlements(appID, used))]
+		}
+		let group = "group.\(appID)"
+		signs(main(["com.apple.security.application-groups": [group]], ["com.apple.security.application-groups": [group]]),
+			  "an app group the profile lists is allowed")
+		refused(main(["com.apple.security.application-groups": [group]], ["com.apple.security.application-groups": [group, "group.com.example.other"]]),
+				"value of com.apple.security.application-groups", "an app group the profile does not list is refused")
+		refused(main(["com.apple.security.application-groups": "*"], ["com.apple.security.application-groups": ["\(appID).shared"]]),
+				"must start with \"group.\"", "an app group not named group.* is refused")
+		refused(main([:], ["keychain-access-groups": ["OTHERTEAM1.\(appID)"]]),
+				"value of keychain-access-groups", "a keychain group of another team is refused (profile allows TEAM.*)")
+		refused(main(["keychain-access-groups": "*"], ["keychain-access-groups": ["OTHERTEAM1.\(appID)"]]),
+				"belongs to another team", "a keychain group of another team is refused even when the profile allows any")
+		signs(main([:], ["keychain-access-groups": ["\(team).\(appID)", "\(team).com.example.shared"]]), "keychain groups within the team are allowed")
+		refused(main(["get-task-allow": false], ["get-task-allow": true]), "value of get-task-allow", "get-task-allow cannot be true when the profile's is false")
+		signs(main([:], ["get-task-allow": false]), "get-task-allow may be false when the profile's is true")
+		refused(main(["aps-environment": "development"], ["aps-environment": "production"]), "value of aps-environment", "a push environment other than the profile's is refused")
+		signs(main(["com.apple.developer.associated-domains": "*"], ["com.apple.developer.associated-domains": ["applinks:example.com"]]),
+			  "associated domains are allowed by a profile value of *")
+		refused(main(["com.apple.developer.icloud-container-identifiers": ["iCloud.\(appID)"]], ["com.apple.developer.icloud-container-identifiers": ["iCloud.com.example.other"]]),
+				"value of com.apple.developer.icloud-container-identifiers", "an iCloud container the profile does not list is refused")
+		refused(main(["com.example.dictionary": ["a": 1]], ["com.example.dictionary": ["a": 1]]),
+				"value of com.example.dictionary", "an entitlement value that is not a string, boolean or list of strings is refused")
+		refused(main(["com.apple.security.application-groups": [group]], ["com.apple.security.application-groups": [group, 7]]),
+				"value of com.apple.security.application-groups", "a list containing a non-string is refused")
+		signs(["": (profile(bundle: appID, edit: { body in
+			var e = body["Entitlements"] as! [String: Any]; e["application-identifier"] = "\(team).*"; body["Entitlements"] = e
+		}), entitlements(appID))], "a wildcard profile signs a specific App ID")
+		refused(["": (profile(bundle: appID, entitlements: ["com.apple.developer.team-identifier": "OTHERTEAM1"]), entitlements(appID))],
+				"profile's entitlements are for another team", "a profile whose entitlements name another team is refused")
+
+		// Each extension is checked against its own profile, not the app's.
+		var parts = makeParts()
+		parts[""] = (profile(bundle: appID, entitlements: ["com.apple.security.application-groups": [group]]), entitlements(appID, ["com.apple.security.application-groups": [group]]))
+		parts["PlugIns/Widget.appex"] = (profile(bundle: "\(appID).widget"), entitlements("\(appID).widget", ["com.apple.security.application-groups": [group]]))
+		refused(parts, "PlugIns/Widget.appex: the provisioning profile does not allow com.apple.security.application-groups",
+				"an extension's app group must be in the extension's own profile")
+		parts["PlugIns/Widget.appex"] = (profile(bundle: "\(appID).widget", entitlements: ["com.apple.security.application-groups": [group]]),
+										 entitlements("\(appID).widget", ["com.apple.security.application-groups": [group]]))
+		signs(parts, "an app and its extension sharing an app group, each allowed by its own profile")
+		check(entitlementsBlob(makeSigned(parts).appendingPathComponent("PlugIns/Widget.appex/Widget"))["com.apple.security.application-groups"] as? [String] == [group],
+			  "the extension is signed with its own app group")
+	}
+
+	static func makeSigned(_ parts: Components) -> URL {
+		let app = makeApp()
+		precondition(sign(app, parts) == nil)
+		return app
+	}
+
 	static func structure() {
 		for (path, text) in [("Watch/Zag Watch.app", "Apple Watch apps are not supported"), ("AppClips/Clip.app", "App Clips are not supported"),
 							 ("XPCServices/Helper.xpc", "XPC services are not supported"), ("PlugIns/Widget.appex/PlugIns/Inner.appex", "inside other bundles"),
@@ -323,13 +402,73 @@ func securitySigner(_ keyFile: String, calls: UnsafeMutablePointer<Int>) -> (Dat
 		check(sign(makeApp(widget: false), ["": (profile(bundle: appID), Data())])?.contains("No entitlements") == true, "missing entitlements are refused")
 		check(sign(work.appendingPathComponent("missing.app"), makeParts())?.contains("Not an app") == true, "a missing app is refused")
 
+		// Malformed profiles.
+		func badProfile(_ provision: Data, _ text: String, _ label: String) {
+			let app = makeApp(widget: false), before = snapshot(app)
+			let error = sign(app, ["": (provision, entitlements(appID))]) ?? ""
+			check(error.contains(text) && snapshot(app) == before, label + " (nothing is changed)")
+		}
+		let good = profile(bundle: appID)
+		badProfile(good.prefix(good.count / 2), "cannot be read", "a truncated profile is refused")
+		badProfile(cmsSigned(Data("not a property list".utf8)), "cannot be read", "a signed profile that is not a property list is refused")
+		badProfile(cmsSigned(plist(["an", "array"])), "cannot be read", "a profile that is not a dictionary is refused")
+		badProfile(profile(bundle: appID, edit: { $0["TeamIdentifier"] = [] }), "has no team", "a profile without a team is refused")
+		badProfile(profile(bundle: appID, edit: { $0["Entitlements"] = nil }), "incomplete", "a profile without entitlements is refused")
+		badProfile(profile(bundle: appID, edit: { $0["ExpirationDate"] = nil }), "incomplete", "a profile without an expiry date is refused")
+		badProfile(profile(bundle: appID, edit: { $0["DeveloperCertificates"] = [] }), "does not include the signing certificate", "a profile without certificates is refused")
+		badProfile(profile(bundle: appID, edit: { $0["DeveloperCertificates"] = [Data("junk".utf8)] }), "does not include the signing certificate", "a profile with an unreadable certificate is refused")
+
+		// Partial failures: whatever was signed before the failure, the
+		// result is reported as failed and does not verify afterwards.
+		let partial = makeApp(), parts = makeParts()
+		try! Data("not a Mach-O".utf8).write(to: partial.appendingPathComponent("Zag"))
+		check(sign(partial, parts)?.contains("Signing failed") == true
+			  && Zsign.verifyComponents(appPath: partial.path, certificate: data("good.der"), components: parts) != nil,
+			  "a main executable that cannot be signed fails, after the extension was signed, and the result does not verify")
+		check(Zsign.verifyComponents(appPath: broken.path, certificate: data("good.der"), components: makeParts()) != nil,
+			  "an app whose library failed to sign does not verify")
+
 		// The original entry point no longer reports success for a certificate
 		// it cannot make a signature with (it used to print "Signed OK!").
 		let legacy = makeApp(widget: false)
 		let profileFile = work.appendingPathComponent("legacy.mobileprovision"), keyFile = pki.appendingPathComponent("fake.key")
 		try! profile(bundle: appID, certificates: [data("fake.der")]).write(to: profileFile)
 		var reported: Bool?
+		let legacyBefore = snapshot(legacy)
 		let result = Zsign.sign(appPath: legacy.path, provisionPath: profileFile.path, p12Path: keyFile.path, removeProvision: true) { ok, _ in reported = ok }
 		check(!result && reported != true, "the original entry point fails instead of reporting an unsigned app as signed")
+		check(snapshot(legacy) == legacyBefore,
+			  "the original entry point stops before changing the app")
+
+		// The original entry point still reads PKCS #12 files (modern and
+		// legacy RC2 encryption, as many exported certificates use); a test
+		// identity then stops at the chain check, which a real Apple
+		// certificate passes (scripts/test-zag-zsign-branch.sh).
+		for name in ["good.p12", "good.legacy.p12"] {
+			var message = ""
+			let app = makeApp(widget: false), provision = work.appendingPathComponent("\(name).mobileprovision")
+			try! profile(bundle: appID).write(to: provision)
+			_ = Zsign.sign(appPath: app.path, provisionPath: provision.path, p12Path: pki.appendingPathComponent(name).path, p12Password: "zagtest") { _, error in
+				message = error?.localizedDescription ?? ""
+			}
+			check(message.contains("not issued by a supported Apple"), "\(name): the certificate is read, then refused by the chain check, with a clear error")
+		}
+
+		// Certificate import's revocation check (checkCert) answers as it did
+		// before this branch: the chain check no longer fails its loading.
+		func revocation(_ password: String) -> (Int32, String) {
+			let done = DispatchSemaphore(value: 0)
+			var result: (Int32, String) = (-1, "")
+			let provision = work.appendingPathComponent("revocation.mobileprovision")
+			try! profile(bundle: appID).write(to: provision)
+			Zsign.checkRevokage(provisionPath: provision.path, p12Path: pki.appendingPathComponent("good.p12").path, p12Password: password) { status, _, error in
+				result = (status, error ?? ""); done.signal()
+			}
+			done.wait()
+			return result
+		}
+		let unknownIssuer = revocation("zagtest"), wrongPassword = revocation("wrong")
+		check(unknownIssuer.0 == 2 && unknownIssuer.1.contains("Unable to determine issuer"), "certificate import: a non-Apple certificate gets the same answer as before")
+		check(wrongPassword.0 == 2 && wrongPassword.1.contains("check your password"), "certificate import: a wrong password gets the same answer as before")
 	}
 }

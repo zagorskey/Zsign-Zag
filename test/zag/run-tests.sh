@@ -65,6 +65,20 @@ leaf noeku test "keyUsage=critical,digitalSignature
 extendedKeyUsage=serverAuth
 authorityKeyIdentifier=keyid"
 leaf other test "$CODE"
+"$OPENSSL" pkcs12 -export -inkey "$A/good.key" -in "$A/good.pem" -passout pass:zagtest -out "$A/good.p12"
+"$OPENSSL" pkcs12 -export -legacy -inkey "$A/good.key" -in "$A/good.pem" -passout pass:zagtest -out "$A/good.legacy.p12"
+# Invalid chains: an issuer that is not an authority, an expired
+# intermediate, and a self-signed leaf.
+leaf notca good "$CODE"
+"$OPENSSL" req -x509 -newkey rsa:2048 -nodes -subj "/CN=Zag Old Intermediate/O=Zag Test/C=US" \
+	-addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign,cRLSign" \
+	-not_before 20200101000000Z -not_after 20200301000000Z -keyout "$A/oldca.key" -out "$A/oldca.pem" 2>/dev/null
+"$OPENSSL" x509 -in "$A/oldca.pem" -outform DER -out "$A/oldca.der"
+leaf underold oldca "$CODE" 20200102000000Z 20300101000000Z
+"$OPENSSL" req -x509 -newkey rsa:2048 -nodes -days 30 -subj "/CN=Apple Development: Zag Test (TESTTEAM01)/OU=TESTTEAM01/O=Zag Test/C=US" \
+	-addext "keyUsage=critical,digitalSignature" -addext "extendedKeyUsage=critical,codeSigning" \
+	-keyout "$A/selfsigned.key" -out "$A/selfsigned.pem" 2>/dev/null
+"$OPENSSL" x509 -in "$A/selfsigned.pem" -outform DER -out "$A/selfsigned.der"
 
 # arm64 iOS binaries: app and extension executables, a framework, a library.
 B="$WORK/bin"; mkdir -p "$B"

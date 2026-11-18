@@ -95,6 +95,7 @@ public:
 	// The intermediate the certificate was verified against, and whether it
 	// is Apple's (then Apple's root is added to the signature too).
 	void*	m_x509Intermediate;
+	string	m_strChainError;
 	bool	m_bAppleChain;
 	bool	m_bStrict;
 	vector<string>	m_arrExtraIntermediates;

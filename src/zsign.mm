@@ -724,6 +724,15 @@ int zsign(
 	if (!zsa.Init(strCertFile, strPKeyFile, strProvFile, strEntitleFile, strPassword, bAdhoc, bSHA256Only, false)) {
 		return -1;
 	}
+	// A certificate that no supported Apple intermediate issued cannot
+	// produce a signature; fail before changing anything.
+	if (!bAdhoc && NULL == zsa.m_x509Intermediate) {
+		if (completionHandler) {
+			NSString* message = [NSString stringWithUTF8String:zsa.m_strChainError.c_str()];
+			completionHandler(NO, [NSError errorWithDomain:@"Failed to Sign" code:-1 userInfo:@{NSLocalizedDescriptionKey : message ?: @"No supported Apple certificate chain."}]);
+		}
+		return -1;
+	}
 	
 	bool bEnableCache = true;
 	string strFolder = strPath;

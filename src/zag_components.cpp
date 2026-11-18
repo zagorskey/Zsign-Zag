@@ -363,8 +363,46 @@ bool PatternMatches(const string& pattern, const string& value)
 	return pattern == value;
 }
 
+// Whether the profile allows an entitlement's value, by the rules iOS
+// applies when it installs an app: a profile value of "*" allows anything;
+// strings match exactly or by a trailing "*"; every element of an array
+// must be allowed by the profile's array (or string); a boolean may be true
+// only where the profile's is true. Other kinds of value (numbers,
+// dictionaries, data) are refused rather than guessed.
+bool ValueAllowed(const jvalue& allowed, const jvalue& value)
+{
+	if (allowed.is_string() && string(allowed.as_cstr()) == "*") {
+		return true;
+	}
+	if (value.is_bool()) {
+		return allowed.is_bool() && (!value.as_bool() || allowed.as_bool());
+	}
+	if (value.is_string()) {
+		if (allowed.is_string()) {
+			return PatternMatches(allowed.as_cstr(), value.as_cstr());
+		}
+		if (allowed.is_array()) {
+			for (size_t i = 0; i < allowed.size(); i++) {
+				if (allowed.at(i).is_string() && PatternMatches(allowed.at(i).as_cstr(), value.as_cstr())) {
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+	if (value.is_array() && (allowed.is_array() || allowed.is_string())) {
+		for (size_t i = 0; i < value.size(); i++) {
+			if (!value.at(i).is_string() || !ValueAllowed(allowed, value.at(i))) {
+				return false;
+			}
+		}
+		return true;
+	}
+	return false;
+}
+
 // The profile is for this team and App ID, still valid, and allows every
-// entitlement the bundle will be signed with.
+// entitlement, and every value, the bundle will be signed with.
 bool CheckComponent(const string& name, const ZSignAsset& asset, const string& bundleId, const string& mainBundleId, string& strError)
 {
 	string content;
@@ -377,8 +415,18 @@ bool CheckComponent(const string& name, const ZSignAsset& asset, const string& b
 		strError = name + ": the entitlements cannot be read";
 		return false;
 	}
-	if (profile["ExpirationDate"].is_date() && profile["ExpirationDate"].as_date() <= time(NULL)) {
+	if (!profile.is_object() || !profile["Entitlements"].is_object() || !profile["ExpirationDate"].is_date()
+		|| !profile["Entitlements"]["application-identifier"].is_string()) {
+		strError = name + ": the provisioning profile is incomplete (entitlements, App ID or expiry missing)";
+		return false;
+	}
+	if (profile["ExpirationDate"].as_date() <= time(NULL)) {
 		strError = name + ": the provisioning profile has expired";
+		return false;
+	}
+	if (profile["Entitlements"].has("com.apple.developer.team-identifier")
+		&& string(profile["Entitlements"]["com.apple.developer.team-identifier"].as_cstr()) != asset.m_strTeamId) {
+		strError = name + ": the provisioning profile's entitlements are for another team";
 		return false;
 	}
 	if (bundleId.empty() || (!mainBundleId.empty() && bundleId.rfind(mainBundleId + ".", 0) != 0)) {
@@ -403,6 +451,25 @@ bool CheckComponent(const string& name, const ZSignAsset& asset, const string& b
 	for (const string& key : keys) {
 		if (!profile["Entitlements"].has(key)) {
 			strError = name + ": the provisioning profile does not allow " + key;
+			return false;
+		}
+		if (!ValueAllowed(profile["Entitlements"][key], entitlements[key])) {
+			strError = name + ": the provisioning profile does not allow this value of " + key;
+			return false;
+		}
+	}
+	// Groups the entitlements name must belong to this team or be app groups.
+	const jvalue& keychain = entitlements["keychain-access-groups"];
+	for (size_t i = 0; keychain.is_array() && i < keychain.size(); i++) {
+		if (string(keychain.at(i).as_cstr()).rfind(asset.m_strTeamId + ".", 0) != 0) {
+			strError = name + ": a keychain access group belongs to another team";
+			return false;
+		}
+	}
+	const jvalue& groups = entitlements["com.apple.security.application-groups"];
+	for (size_t i = 0; groups.is_array() && i < groups.size(); i++) {
+		if (string(groups.at(i).as_cstr()).rfind("group.", 0) != 0) {
+			strError = name + ": an app group must start with \"group.\"";
 			return false;
 		}
 	}
