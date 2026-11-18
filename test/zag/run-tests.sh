@@ -93,3 +93,33 @@ swiftc -parse-as-library -target "$TARGET" -I "$WORK/include" \
 cd "$WORK"
 ZAG_OPENSSL="$OPENSSL" ZAG_PKI="$A" ZAG_BIN="$B" ZAG_WORK="$WORK" "$WORK/tests" > "$WORK/log" 2>&1 || { grep -v '^>>>' "$WORK/log" | tail -30; exit 1; }
 grep -aoE '(PASS|SUCCESS): .*' "$WORK/log"
+
+# DER entitlements, byte for byte against codesign's own for the same plist:
+# booleans, integers, nested dictionaries, arrays and unsorted keys.
+D="$WORK/der"; mkdir -p "$D"
+clang++ "${FLAGS[@]}" "$HERE/der-check.cpp" "$WORK/libzsign.a" -framework Foundation -framework Security -o "$D/der-check"
+der_case() { # name plist-body
+	printf '<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTD/PropertyList-1.0.dtd">\n<plist version="1.0"><dict>%s</dict></plist>\n' "$2" > "$D/$1.plist"
+	cp "$B/exe" "$D/$1.bin"
+	codesign -f -s - --entitlements "$D/$1.plist" "$D/$1.bin" 2>/dev/null
+	python3 -I - "$D/$1.bin" "$D/$1.apple" <<'PY2'
+import struct, sys
+d = open(sys.argv[1], "rb").read(); off = 32
+for _ in range(struct.unpack_from("<I", d, 16)[0]):
+    cmd, size = struct.unpack_from("<II", d, off)
+    if cmd == 0x1D: start, length = struct.unpack_from("<II", d, off + 8)
+    off += size
+blob = d[start:start + length]
+for i in range(struct.unpack_from(">I", blob, 8)[0]):
+    kind, o = struct.unpack_from(">II", blob, 12 + 8 * i)
+    if kind == 7:
+        open(sys.argv[2], "wb").write(blob[o + 8:o + struct.unpack_from(">I", blob, o + 4)[0]])
+PY2
+	"$D/der-check" "$D/$1.plist" "$D/$1.zsign" || { echo "FAIL: DER entitlements ($1) not built" >&2; exit 1; }
+	cmp -s "$D/$1.apple" "$D/$1.zsign" || { echo "FAIL: DER entitlements ($1) differ from codesign's" >&2; exit 1; }
+	echo "PASS: DER entitlements ($1) are byte-identical to codesign's"
+}
+der_case booleans '<key>get-task-allow</key><true/><key>com.apple.developer.healthkit</key><false/><key>application-identifier</key><string>TESTTEAM01.com.example.app</string>'
+der_case integers '<key>a</key><integer>0</integer><key>b</key><integer>127</integer><key>c</key><integer>128</integer><key>d</key><integer>300</integer><key>e</key><integer>65535</integer><key>f</key><integer>-1</integer>'
+der_case nested '<key>z-dict</key><dict><key>inner</key><string>x</string><key>flag</key><false/><key>deeper</key><dict><key>b</key><true/><key>a</key><array><string>1</string><string>2</string></array></dict></dict><key>a-list</key><array><string>TESTTEAM01.*</string><string>com.apple.token</string></array>'
+echo "SUCCESS: 3 DER entitlement comparisons with codesign passed"
