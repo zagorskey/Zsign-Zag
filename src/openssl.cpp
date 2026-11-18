@@ -109,7 +109,7 @@ bool ZSignAsset::CMSError()
 	return false;
 }
 
-void* ZSignAsset::GenerateASN1Type(const string& value)
+void* ZSignAsset::GenerateASN1Type(const string& value, const char* szDigest)
 {
 	long errline = -1;
 	char* genstr = NULL;
@@ -120,7 +120,7 @@ void* ZSignAsset::GenerateASN1Type(const string& value)
 		ZLog::Error(">>> NCONF_new failed\n");
 		BIO_free(ldapbio);
 	}
-	string a = "asn1=SEQUENCE:A\n[A]\nC=OBJECT:sha256\nB=FORMAT:HEX,OCT:" + value + "\n";
+	string a = string("asn1=SEQUENCE:A\n[A]\nC=OBJECT:") + szDigest + "\nB=FORMAT:HEX,OCT:" + value + "\n";
 	int code = BIO_puts(ldapbio, a.c_str());
 	if (NCONF_load_bio(cnf, ldapbio, &errline) <= 0) {
 		BIO_free(ldapbio);
@@ -196,14 +196,19 @@ bool ZSignAsset::GenerateCMS(void* pscert, void* pspkey, const string& strCDHash
 		return CMSError();
 	}
 
-	// add CDHashes
-	string sha256;
-	char buf[16] = { 0 };
-	for (size_t i = 0; i < strAltnateCodeDirectorySlot256.size(); i++) {
-		snprintf(buf, sizeof(buf), "%02x", (uint8_t)strAltnateCodeDirectorySlot256[i]);
-		sha256 += buf;
-	}
-	transform(sha256.begin(), sha256.end(), sha256.begin(), ::toupper);
+	// add CDHashes: one (digest, hash) per CodeDirectory, as codesign writes
+	// them. Listing only the SHA-256 one made macOS reject the signature
+	// (-67061) when a SHA-1 CodeDirectory is present.
+	auto hex = [](const string& data) {
+		string out;
+		char buf[16] = { 0 };
+		for (size_t i = 0; i < data.size(); i++) {
+			snprintf(buf, sizeof(buf), "%02X", (uint8_t)data[i]);
+			out += buf;
+		}
+		return out;
+	};
+	string sha256 = hex(strAltnateCodeDirectorySlot256);
 
 	ASN1_OBJECT* obj2 = OBJ_txt2obj("1.2.840.113635.100.9.2", 1);
 	if (!obj2) {
@@ -213,7 +218,12 @@ bool ZSignAsset::GenerateCMS(void* pscert, void* pspkey, const string& strCDHash
 	X509_ATTRIBUTE* attr = X509_ATTRIBUTE_new();
 	X509_ATTRIBUTE_set1_object(attr, obj2);
 
-	ASN1_TYPE* type_256 = (ASN1_TYPE*)GenerateASN1Type(sha256);
+	if (!strCodeDirectorySlotSHA1.empty()) {
+		ASN1_TYPE* type_1 = (ASN1_TYPE*)GenerateASN1Type(hex(strCodeDirectorySlotSHA1), "sha1");
+		X509_ATTRIBUTE_set1_data(attr, V_ASN1_SEQUENCE,
+			type_1->value.asn1_string->data, type_1->value.asn1_string->length);
+	}
+	ASN1_TYPE* type_256 = (ASN1_TYPE*)GenerateASN1Type(sha256, "sha256");
 	X509_ATTRIBUTE_set1_data(attr, V_ASN1_SEQUENCE,
 		type_256->value.asn1_string->data, type_256->value.asn1_string->length);
 	int addHashSHA = CMS_signed_add1_attr(si, attr);
