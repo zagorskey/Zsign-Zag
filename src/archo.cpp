@@ -436,7 +436,12 @@ bool ZArchO::BuildCodeSignature(ZSignAsset* pSignAsset,
 
 	string strCMSSignatureSlot;
 	if (!pSignAsset->m_bAdhoc) { //adhoc remove cms signature slot
-		ZSign::SlotBuildCMSSignature(pSignAsset, strCodeDirectorySlot, strAltnateCodeDirectorySlot, strCMSSignatureSlot);
+		// Without the CMS signature the result is unsigned: never write it.
+		if (!ZSign::SlotBuildCMSSignature(pSignAsset, strCodeDirectorySlot, strAltnateCodeDirectorySlot, strCMSSignatureSlot) || strCMSSignatureSlot.empty()) {
+			ZLog::Error(">>> CMS signature failed!\n");
+			strOutput.clear();
+			return false;
+		}
 	}
 
 	uint32_t uCodeDirectorySlotLength = (uint32_t)strCodeDirectorySlot.size();

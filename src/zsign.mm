@@ -10,6 +10,7 @@
 #include "openssl.h"
 #include "macho.h"
 #include "bundle.h"
+#include "zag_components.h"
 #include "openssl.h"
 #include "timer.h"
 #include "archive.h"
@@ -723,6 +724,15 @@ int zsign(
 	if (!zsa.Init(strCertFile, strPKeyFile, strProvFile, strEntitleFile, strPassword, bAdhoc, bSHA256Only, false)) {
 		return -1;
 	}
+	// A certificate that no supported Apple intermediate issued cannot
+	// produce a signature; fail before changing anything.
+	if (!bAdhoc && NULL == zsa.m_x509Intermediate) {
+		if (completionHandler) {
+			NSString* message = [NSString stringWithUTF8String:zsa.m_strChainError.c_str()];
+			completionHandler(NO, [NSError errorWithDomain:@"Failed to Sign" code:-1 userInfo:@{NSLocalizedDescriptionKey : message ?: @"No supported Apple certificate chain."}]);
+		}
+		return -1;
+	}
 	
 	bool bEnableCache = true;
 	string strFolder = strPath;
@@ -897,4 +907,77 @@ int checkCert(
 
 
 
+}
+
+static string ZagString(NSData *data)
+{
+	return data ? string((const char *)data.bytes, data.length) : string();
+}
+
+bool ZagSignComponents(
+	NSString *app,
+	NSData *certificate,
+	NSData *keyData,
+	NSString *keyPassword,
+	ZagRawSignerBlock signer,
+	NSDictionary<NSString *, NSDictionary<NSString *, NSData *> *> *components,
+	NSString *bundleIdentifier,
+	NSArray<NSData *> *extraIntermediates,
+	NSString **error
+) {
+	ZagSignRequest request;
+	request.strAppFolder = app.UTF8String ?: "";
+	request.strCertDER = ZagString(certificate);
+	request.strKeyData = ZagString(keyData);
+	request.strKeyPassword = keyPassword.UTF8String ?: "";
+	request.strBundleId = bundleIdentifier.UTF8String ?: "";
+	for (NSData *intermediate in extraIntermediates) {
+		request.arrExtraIntermediates.push_back(ZagString(intermediate));
+	}
+	for (NSString *path in components) {
+		NSDictionary<NSString *, NSData *> *component = components[path];
+		request.components[path.UTF8String] = { ZagString(component[@"provision"]), ZagString(component[@"entitlements"]) };
+	}
+	if (signer) {
+		ZagRawSignerBlock block = [signer copy];
+		request.signer = [block](const string& digestInfo, string& signature) {
+			@autoreleasepool {
+				NSData *result = block([NSData dataWithBytes:digestInfo.data() length:digestInfo.size()]);
+				if (!result) {
+					return false;
+				}
+				signature.assign((const char *)result.bytes, result.length);
+				return true;
+			}
+		};
+	}
+
+	string strError;
+	bool ok = ZagSignApp(request, strError);
+	// Key data the caller passed stays theirs; wipe this copy.
+	if (!request.strKeyData.empty()) {
+		OPENSSL_cleanse(&request.strKeyData[0], request.strKeyData.size());
+	}
+	if (!ok && error) {
+		*error = [NSString stringWithUTF8String:strError.c_str()] ?: @"Signing failed.";
+	}
+	return ok;
+}
+
+bool ZagVerifyComponents(
+	NSString *app,
+	NSData *certificate,
+	NSDictionary<NSString *, NSDictionary<NSString *, NSData *> *> *components,
+	NSString **error
+) {
+	map<string, ZagComponentInput> input;
+	for (NSString *path in components) {
+		input[path.UTF8String] = { ZagString(components[path][@"provision"]), ZagString(components[path][@"entitlements"]) };
+	}
+	string strError;
+	bool ok = ZagVerifyApp(app.UTF8String ?: "", ZagString(certificate), input, strError);
+	if (!ok && error) {
+		*error = [NSString stringWithUTF8String:strError.c_str()] ?: @"Not verified.";
+	}
+	return ok;
 }

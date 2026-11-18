@@ -1,4 +1,5 @@
 #include "common.h"
+#include <algorithm>
 #include "json.h"
 #include "mach-o.h"
 #include "openssl.h"
@@ -21,20 +22,26 @@ void ZSign::_DERLength(string& strBlob, uint64_t uLength)
 string ZSign::_DER(const jvalue& data)
 {
 	string strOutput;
+	// Apple's DER entitlements (as codesign writes them): BOOLEAN TRUE is
+	// 0xFF, INTEGERs are minimal two's complement, dictionaries are [16]
+	// with their keys sorted. SlotBuildDerEntitlements adds the envelope.
 	if (data.is_bool()) {
 		strOutput.append(1, 0x01);
 		strOutput.append(1, 1);
-		strOutput.append(1, data.as_bool() ? 1 : 0);
+		strOutput.append(1, data.as_bool() ? (char)0xff : 0x00);
 	} else if (data.is_int()) {
-		uint64_t uVal = data.as_int64();
+		int64_t iVal = data.as_int64();
+		string strBytes;
+		for (int i = 7; i >= 0; i--) {
+			strBytes.append(1, (char)((uint64_t)iVal >> (i * 8)));
+		}
+		// Drop leading bytes that only repeat the sign.
+		while (strBytes.size() > 1 && (((uint8_t)strBytes[0] == 0x00 && !((uint8_t)strBytes[1] & 0x80)) || ((uint8_t)strBytes[0] == 0xff && ((uint8_t)strBytes[1] & 0x80)))) {
+			strBytes.erase(0, 1);
+		}
 		strOutput.append(1, 0x02);
-		_DERLength(strOutput, uVal);
-
-		uint32_t sLength = (64 - ZUtil::builtin_clzll(uVal) + 7) / 8;
-		sLength *= 8;
-		do {
-			strOutput.append(1, (char)(uVal >> (sLength -= 8)));
-		} while (sLength != 0);
+		_DERLength(strOutput, strBytes.size());
+		strOutput += strBytes;
 	} else if (data.is_string()) {
 		string strVal = data.as_cstr();
 		strOutput.append(1, 0x0c);
@@ -53,6 +60,7 @@ string ZSign::_DER(const jvalue& data)
 		string strDict;
 		vector<string> arrKeys;
 		data.get_keys(arrKeys);
+		sort(arrKeys.begin(), arrKeys.end());
 		for (size_t i = 0; i < arrKeys.size(); i++) {
 			string& strKey = arrKeys[i];
 			string strVal = _DER(data[strKey]);
@@ -67,7 +75,7 @@ string ZSign::_DER(const jvalue& data)
 			strDict += strVal;
 		}
 
-		strOutput.append(1, 0x31);
+		strOutput.append(1, (char)0xb0);
 		_DERLength(strOutput, strDict.size());
 		strOutput += strDict;
 	} else if (data.is_double()) {
@@ -257,7 +265,11 @@ bool ZSign::SlotBuildDerEntitlements(const string& strEntitlements, string& strO
 	jvalue jvInfo;
 	jvInfo.read_plist(strEntitlements);
 
-	string strRawEntitlementsData = _DER(jvInfo);
+	// [APPLICATION 16] { INTEGER 1, [16] { entitlements } }
+	string strVersioned = string("\x02\x01\x01", 3) + _DER(jvInfo);
+	string strRawEntitlementsData(1, (char)0x70);
+	_DERLength(strRawEntitlementsData, strVersioned.size());
+	strRawEntitlementsData += strVersioned;
 	uint32_t uMagic = BE((uint32_t)CSMAGIC_EMBEDDED_DER_ENTITLEMENTS);
 	uint32_t uLength = BE((uint32_t)strRawEntitlementsData.size() + 8);
 

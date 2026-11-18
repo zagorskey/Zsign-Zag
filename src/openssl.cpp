@@ -7,6 +7,8 @@
 #include <openssl/provider.h>
 #include <openssl/pkcs12.h>
 #include <openssl/conf.h>
+#include <openssl/rsa.h>
+#include <openssl/x509v3.h>
 
 const char* ZSignAsset::s_szAppleDevCACert = ""
 "-----BEGIN CERTIFICATE-----\n"
@@ -107,7 +109,7 @@ bool ZSignAsset::CMSError()
 	return false;
 }
 
-void* ZSignAsset::GenerateASN1Type(const string& value)
+void* ZSignAsset::GenerateASN1Type(const string& value, const char* szDigest)
 {
 	long errline = -1;
 	char* genstr = NULL;
@@ -118,7 +120,7 @@ void* ZSignAsset::GenerateASN1Type(const string& value)
 		ZLog::Error(">>> NCONF_new failed\n");
 		BIO_free(ldapbio);
 	}
-	string a = "asn1=SEQUENCE:A\n[A]\nC=OBJECT:sha256\nB=FORMAT:HEX,OCT:" + value + "\n";
+	string a = string("asn1=SEQUENCE:A\n[A]\nC=OBJECT:") + szDigest + "\nB=FORMAT:HEX,OCT:" + value + "\n";
 	int code = BIO_puts(ldapbio, a.c_str());
 	if (NCONF_load_bio(cnf, ldapbio, &errline) <= 0) {
 		BIO_free(ldapbio);
@@ -146,39 +148,23 @@ bool ZSignAsset::GenerateCMS(void* pscert, void* pspkey, const string& strCDHash
 	X509* scert = (X509*)pscert;
 	EVP_PKEY* spkey = (EVP_PKEY*)pspkey;
 
-	BIO* bother1;
-	unsigned long issuerHash = X509_issuer_name_hash(scert);
-	if (0x817d2f7a == issuerHash) {
-		bother1 = BIO_new_mem_buf(s_szAppleDevCACert, (int)strlen(s_szAppleDevCACert));
-	} else if (0x9b16b75c == issuerHash) {
-		bother1 = BIO_new_mem_buf(s_szAppleDevCACertG3, (int)strlen(s_szAppleDevCACertG3));
-	} else {
-		ZLog::Error(">>> Unknown issuer hash!\n");
+	// The chain was chosen when the identity was loaded, by verifying the
+	// certificate's signature (not by the issuer's name).
+	if (NULL == m_x509Intermediate) {
+		ZLog::Error(">>> The signing certificate's issuer was not verified!\n");
 		return false;
 	}
-
-	BIO* bother2 = BIO_new_mem_buf(s_szAppleRootCACert, (int)strlen(s_szAppleRootCACert));
-	if (!bother1 || !bother2) {
-		return CMSError();
-	}
-
-	X509* ocert1 = PEM_read_bio_X509(bother1, NULL, 0, NULL);
-	X509* ocert2 = PEM_read_bio_X509(bother2, NULL, 0, NULL);
-	if (!ocert1 || !ocert2) {
-		return CMSError();
-	}
-
 	STACK_OF(X509)* otherCerts = sk_X509_new_null();
-	if (!otherCerts) {
+	if (!otherCerts || !sk_X509_push(otherCerts, X509_dup((X509*)m_x509Intermediate))) {
 		return CMSError();
 	}
-
-	if (!sk_X509_push(otherCerts, ocert1)) {
-		return CMSError();
-	}
-
-	if (!sk_X509_push(otherCerts, ocert2)) {
-		return CMSError();
+	if (m_bAppleChain) {
+		BIO* broot = BIO_new_mem_buf(s_szAppleRootCACert, (int)strlen(s_szAppleRootCACert));
+		X509* root = broot ? PEM_read_bio_X509(broot, NULL, 0, NULL) : NULL;
+		BIO_free(broot);
+		if (!root || !sk_X509_push(otherCerts, root)) {
+			return CMSError();
+		}
 	}
 
 	BIO* in = BIO_new_mem_buf(strCDHashData.c_str(), (int)strCDHashData.size());
@@ -210,14 +196,19 @@ bool ZSignAsset::GenerateCMS(void* pscert, void* pspkey, const string& strCDHash
 		return CMSError();
 	}
 
-	// add CDHashes
-	string sha256;
-	char buf[16] = { 0 };
-	for (size_t i = 0; i < strAltnateCodeDirectorySlot256.size(); i++) {
-		snprintf(buf, sizeof(buf), "%02x", (uint8_t)strAltnateCodeDirectorySlot256[i]);
-		sha256 += buf;
-	}
-	transform(sha256.begin(), sha256.end(), sha256.begin(), ::toupper);
+	// add CDHashes: one (digest, hash) per CodeDirectory, as codesign writes
+	// them. Listing only the SHA-256 one made macOS reject the signature
+	// (-67061) when a SHA-1 CodeDirectory is present.
+	auto hex = [](const string& data) {
+		string out;
+		char buf[16] = { 0 };
+		for (size_t i = 0; i < data.size(); i++) {
+			snprintf(buf, sizeof(buf), "%02X", (uint8_t)data[i]);
+			out += buf;
+		}
+		return out;
+	};
+	string sha256 = hex(strAltnateCodeDirectorySlot256);
 
 	ASN1_OBJECT* obj2 = OBJ_txt2obj("1.2.840.113635.100.9.2", 1);
 	if (!obj2) {
@@ -227,7 +218,12 @@ bool ZSignAsset::GenerateCMS(void* pscert, void* pspkey, const string& strCDHash
 	X509_ATTRIBUTE* attr = X509_ATTRIBUTE_new();
 	X509_ATTRIBUTE_set1_object(attr, obj2);
 
-	ASN1_TYPE* type_256 = (ASN1_TYPE*)GenerateASN1Type(sha256);
+	if (!strCodeDirectorySlotSHA1.empty()) {
+		ASN1_TYPE* type_1 = (ASN1_TYPE*)GenerateASN1Type(hex(strCodeDirectorySlotSHA1), "sha1");
+		X509_ATTRIBUTE_set1_data(attr, V_ASN1_SEQUENCE,
+			type_1->value.asn1_string->data, type_1->value.asn1_string->length);
+	}
+	ASN1_TYPE* type_256 = (ASN1_TYPE*)GenerateASN1Type(sha256, "sha256");
 	X509_ATTRIBUTE_set1_data(attr, V_ASN1_SEQUENCE,
 		type_256->value.asn1_string->data, type_256->value.asn1_string->length);
 	int addHashSHA = CMS_signed_add1_attr(si, attr);
@@ -558,6 +554,9 @@ ZSignAsset::ZSignAsset()
 {
 	m_evpPKey = NULL;
 	m_x509Cert = NULL;
+	m_x509Intermediate = NULL;
+	m_bAppleChain = false;
+	m_bStrict = false;
 	m_bAdhoc = false;
 	m_bSingleBinary = false;
 	m_bSHA256Only = false;
@@ -612,27 +611,9 @@ bool ZSignAsset::Init(
 
 	X509* x509Cert = NULL;
 	EVP_PKEY* evpPKey = NULL;
-	BIO* bioPKey = BIO_new_file(strPKeyFile.c_str(), "rb");
-	if (NULL != bioPKey) {
-		evpPKey = PEM_read_bio_PrivateKey(bioPKey, NULL, NULL, (void*)strPassword.c_str());
-		if (NULL == evpPKey) {
-			BIO_reset(bioPKey);
-			evpPKey = d2i_PrivateKey_bio(bioPKey, NULL);
-			if (NULL == evpPKey) {
-				BIO_reset(bioPKey);
-				OSSL_PROVIDER_load(NULL, "legacy");
-				PKCS12* p12 = d2i_PKCS12_bio(bioPKey, NULL);
-				if (NULL != p12) {
-					if (0 == PKCS12_parse(p12, strPassword.c_str(), &evpPKey, &x509Cert, NULL)) {
-						CMSError();
-					}
-					PKCS12_free(p12);
-				} else {
-					CMSError();
-				}
-			}
-		}
-		BIO_free(bioPKey);
+	string strKeyData;
+	if (ZFile::ReadFile(strPKeyFile.c_str(), strKeyData)) {
+		LoadPrivateKey(strKeyData, strPassword, (void**)&evpPKey, (void**)&x509Cert);
 	}
 
 	if (NULL == evpPKey) {
@@ -689,6 +670,338 @@ bool ZSignAsset::Init(
 
 	m_evpPKey = evpPKey;
 	m_x509Cert = x509Cert;
+
+	// Without a verified Apple chain no signature can be made. That is
+	// reported by the signing entry point (zsign), not here, so callers that
+	// only inspect a certificate (checkCert) behave as before.
+	if (!SelectChain(m_strChainError)) {
+		ZLog::ErrorV(">>> %s\n", m_strChainError.c_str());
+	}
+	return true;
+}
+
+bool ZSignAsset::LoadPrivateKey(const string& strKeyData, const string& strPassword, void** ppKey, void** ppCert)
+{
+	EVP_PKEY* evpPKey = NULL;
+	X509* x509Cert = NULL;
+	BIO* bioPKey = BIO_new_mem_buf(strKeyData.data(), (int)strKeyData.size());
+	if (NULL != bioPKey) {
+		evpPKey = PEM_read_bio_PrivateKey(bioPKey, NULL, NULL, (void*)strPassword.c_str());
+		if (NULL == evpPKey) {
+			BIO_reset(bioPKey);
+			evpPKey = d2i_PrivateKey_bio(bioPKey, NULL);
+			if (NULL == evpPKey) {
+				BIO_reset(bioPKey);
+				OSSL_PROVIDER_load(NULL, "legacy");
+				PKCS12* p12 = d2i_PKCS12_bio(bioPKey, NULL);
+				if (NULL != p12) {
+					if (0 == PKCS12_parse(p12, strPassword.c_str(), &evpPKey, &x509Cert, NULL)) {
+						CMSError();
+					}
+					PKCS12_free(p12);
+				} else {
+					CMSError();
+				}
+			}
+		}
+		BIO_free(bioPKey);
+	}
+	*ppKey = evpPKey;
+	*ppCert = x509Cert;
+	return NULL != evpPKey;
+}
+
+// Picks the intermediate that actually signed the certificate: its name and
+// key identifiers must match and its key must verify the certificate's
+// signature. A certificate merely naming an Apple intermediate as issuer is
+// refused. Strict mode also requires the certificate to be valid now and,
+// when it limits its use, to allow code signing.
+bool ZSignAsset::SelectChain(string& strError)
+{
+	X509* cert = (X509*)m_x509Cert;
+	if (NULL == cert) {
+		strError = "No signing certificate.";
+		return false;
+	}
+
+	vector<std::pair<X509*, bool>> candidates;
+	for (const char* pem : { s_szAppleDevCACertG3, s_szAppleDevCACert }) {
+		BIO* bio = BIO_new_mem_buf(pem, (int)strlen(pem));
+		X509* c = bio ? PEM_read_bio_X509(bio, NULL, 0, NULL) : NULL;
+		BIO_free(bio);
+		if (c) {
+			candidates.push_back(std::make_pair(c, true));
+		}
+	}
+	for (const string& der : m_arrExtraIntermediates) {
+		const unsigned char* p = (const unsigned char*)der.data();
+		X509* c = d2i_X509(NULL, &p, (long)der.size());
+		if (c) {
+			candidates.push_back(std::make_pair(c, false));
+		}
+	}
+
+	X509* chosen = NULL;
+	bool bApple = false;
+	for (auto& candidate : candidates) {
+		if (NULL == chosen && X509_V_OK == X509_check_issued(candidate.first, cert)) {
+			EVP_PKEY* pub = X509_get0_pubkey(candidate.first);
+			if (pub && 1 == X509_verify(cert, pub)) {
+				chosen = candidate.first;
+				bApple = candidate.second;
+				continue;
+			}
+		}
+		X509_free(candidate.first);
+	}
+	ERR_clear_error();
+
+	if (NULL == chosen) {
+		strError = "The signing certificate is not issued by a supported Apple Worldwide Developer Relations intermediate.";
+		return false;
+	}
+
+	if (m_bStrict) {
+		if (X509_cmp_current_time(X509_get0_notBefore(cert)) >= 0) {
+			X509_free(chosen);
+			strError = "The signing certificate is not valid yet.";
+			return false;
+		}
+		if (X509_cmp_current_time(X509_get0_notAfter(cert)) <= 0) {
+			X509_free(chosen);
+			strError = "The signing certificate has expired.";
+			return false;
+		}
+		// The issuer must be a certificate authority, valid now.
+		if (X509_check_ca(chosen) < 1) {
+			X509_free(chosen);
+			strError = "The signing certificate's issuer is not a certificate authority.";
+			return false;
+		}
+		if (X509_cmp_current_time(X509_get0_notBefore(chosen)) >= 0 || X509_cmp_current_time(X509_get0_notAfter(chosen)) <= 0) {
+			X509_free(chosen);
+			strError = "The signing certificate's issuer is not valid now.";
+			return false;
+		}
+		if ((X509_get_extension_flags(cert) & EXFLAG_XKUSAGE) && !(X509_get_extended_key_usage(cert) & XKU_CODE_SIGN)) {
+			X509_free(chosen);
+			strError = "The signing certificate does not allow code signing.";
+			return false;
+		}
+	}
+
+	if (m_x509Intermediate) {
+		X509_free((X509*)m_x509Intermediate);
+	}
+	m_x509Intermediate = chosen;
+	m_bAppleChain = bApple;
+	return true;
+}
+
+// A key whose private operation is the caller's signer: OpenSSL only sees
+// the public key (from the certificate) and asks the signer for each RSA
+// PKCS #1 v1.5 signature, so the private key never enters this process's
+// OpenSSL state.
+static int s_nZagSignerIndex = -1;
+
+static int ZagSignerPrivEnc(int flen, const unsigned char* from, unsigned char* to, RSA* rsa, int padding)
+{
+	ZagRawSigner* signer = (ZagRawSigner*)RSA_get_ex_data(rsa, s_nZagSignerIndex);
+	if (NULL == signer || RSA_PKCS1_PADDING != padding) {
+		return -1;
+	}
+	string strSignature;
+	if (!(*signer)(string((const char*)from, flen), strSignature) || strSignature.size() != (size_t)RSA_size(rsa)) {
+		return -1;
+	}
+	memcpy(to, strSignature.data(), strSignature.size());
+	return (int)strSignature.size();
+}
+
+static int ZagSignerPrivDec(int, const unsigned char*, unsigned char*, RSA*, int)
+{
+	return -1;
+}
+
+static EVP_PKEY* ZagMakeSignerKey(X509* cert, ZagRawSigner* signer)
+{
+	static RSA_METHOD* s_pMethod = NULL;
+	if (NULL == s_pMethod) {
+		s_nZagSignerIndex = RSA_get_ex_new_index(0, NULL, NULL, NULL, NULL);
+		s_pMethod = RSA_meth_dup(RSA_PKCS1_OpenSSL());
+		RSA_meth_set1_name(s_pMethod, "zag-raw-signer");
+		RSA_meth_set_priv_enc(s_pMethod, ZagSignerPrivEnc);
+		RSA_meth_set_priv_dec(s_pMethod, ZagSignerPrivDec);
+	}
+	EVP_PKEY* pub = X509_get0_pubkey(cert);
+	const RSA* pubRSA = pub ? EVP_PKEY_get0_RSA(pub) : NULL;
+	if (NULL == pubRSA) {
+		return NULL;
+	}
+	const BIGNUM* n = NULL;
+	const BIGNUM* e = NULL;
+	RSA_get0_key(pubRSA, &n, &e, NULL);
+	RSA* rsa = RSA_new();
+	EVP_PKEY* key = EVP_PKEY_new();
+	if (!rsa || !key || !RSA_set_method(rsa, s_pMethod) || !RSA_set0_key(rsa, BN_dup(n), BN_dup(e), NULL)
+		|| !RSA_set_ex_data(rsa, s_nZagSignerIndex, signer) || !EVP_PKEY_assign_RSA(key, rsa)) {
+		RSA_free(rsa);
+		EVP_PKEY_free(key);
+		return NULL;
+	}
+	return key;
+}
+
+static bool ZagProfileContains(const jvalue& jvProv, X509* cert)
+{
+	unsigned char* der = NULL;
+	int len = i2d_X509(cert, &der);
+	if (len <= 0) {
+		return false;
+	}
+	string strCert((const char*)der, len);
+	OPENSSL_free(der);
+	for (size_t i = 0; i < jvProv["DeveloperCertificates"].size(); i++) {
+		if (jvProv["DeveloperCertificates"][i].as_data() == strCert) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool ZagReadProfile(const string& strProvData, jvalue& jvProv, string& strTeamId, string& strError)
+{
+	string strContent;
+	if (!ZSignAsset::GetCMSContent(strProvData, strContent) || !jvProv.read_plist(strContent) || !jvProv.is_object()) {
+		strError = "The provisioning profile cannot be read.";
+		return false;
+	}
+	strTeamId = jvProv["TeamIdentifier"][0].as_cstr();
+	if (strTeamId.empty()) {
+		strError = "The provisioning profile has no team.";
+		return false;
+	}
+	return true;
+}
+
+bool ZSignAsset::InitStrict(const string& strCertDER,
+							const string& strKeyData,
+							const string& strKeyPassword,
+							ZagRawSigner signer,
+							const string& strProvData,
+							const string& strEntitleData,
+							const vector<string>& arrExtraIntermediatesDER,
+							string& strError)
+{
+	m_bStrict = true;
+	m_bSHA256Only = false;
+	m_arrExtraIntermediates = arrExtraIntermediatesDER;
+	m_strProvData = strProvData;
+	m_strEntitleData = strEntitleData;
+
+	jvalue jvProv;
+	if (!ZagReadProfile(m_strProvData, jvProv, m_strTeamId, strError)) {
+		return false;
+	}
+	if (m_strEntitleData.empty()) {
+		strError = "No entitlements were given.";
+		return false;
+	}
+
+	X509* cert = NULL;
+	if (!strCertDER.empty()) {
+		const unsigned char* p = (const unsigned char*)strCertDER.data();
+		cert = d2i_X509(NULL, &p, (long)strCertDER.size());
+		if (NULL == cert) {
+			strError = "The signing certificate cannot be read.";
+			return false;
+		}
+	}
+
+	EVP_PKEY* key = NULL;
+	if (signer) {
+		if (NULL == cert) {
+			strError = "A signer needs its certificate.";
+			return false;
+		}
+		m_pSigner = std::make_shared<ZagRawSigner>(signer);
+		key = ZagMakeSignerKey(cert, m_pSigner.get());
+	} else {
+		X509* bundled = NULL;
+		LoadPrivateKey(strKeyData, strKeyPassword, (void**)&key, (void**)&bundled);
+		if (NULL == cert) {
+			cert = bundled;
+		} else if (bundled) {
+			X509_free(bundled);
+		}
+		if (key && NULL == cert) {
+			// The certificate from the profile that matches the key.
+			for (size_t i = 0; i < jvProv["DeveloperCertificates"].size() && NULL == cert; i++) {
+				string strData = jvProv["DeveloperCertificates"][i].as_data();
+				const unsigned char* p = (const unsigned char*)strData.data();
+				X509* candidate = d2i_X509(NULL, &p, (long)strData.size());
+				if (candidate && X509_check_private_key(candidate, key)) {
+					cert = candidate;
+				} else if (candidate) {
+					X509_free(candidate);
+				}
+			}
+		}
+	}
+	ERR_clear_error();
+	if (NULL == key) {
+		strError = "The signing key cannot be read.";
+		return false;
+	}
+	if (NULL == cert || !X509_check_private_key(cert, key)) {
+		strError = "The signing certificate is not for this key.";
+		return false;
+	}
+	m_evpPKey = key;
+	m_x509Cert = cert;
+
+	if (!SelectChain(strError)) {
+		return false;
+	}
+	if (!ZagProfileContains(jvProv, cert)) {
+		strError = "The provisioning profile does not include the signing certificate.";
+		return false;
+	}
+	if (!GetCertSubjectCN(cert, m_strSubjectCN)) {
+		strError = "The signing certificate has no common name.";
+		return false;
+	}
+	return true;
+}
+
+bool ZSignAsset::InitComponent(const ZSignAsset& identity, const string& strProvData, const string& strEntitleData, string& strError)
+{
+	m_bStrict = true;
+	m_bSHA256Only = identity.m_bSHA256Only;
+	m_strProvData = strProvData;
+	m_strEntitleData = strEntitleData;
+	jvalue jvProv;
+	if (!ZagReadProfile(m_strProvData, jvProv, m_strTeamId, strError)) {
+		return false;
+	}
+	if (m_strEntitleData.empty()) {
+		strError = "No entitlements were given.";
+		return false;
+	}
+	if (m_strTeamId != identity.m_strTeamId) {
+		strError = "The provisioning profile is for another team.";
+		return false;
+	}
+	if (!ZagProfileContains(jvProv, (X509*)identity.m_x509Cert)) {
+		strError = "The provisioning profile does not include the signing certificate.";
+		return false;
+	}
+	// Shared, not owned: the identity outlives its components.
+	m_evpPKey = identity.m_evpPKey;
+	m_x509Cert = identity.m_x509Cert;
+	m_x509Intermediate = X509_dup((X509*)identity.m_x509Intermediate);
+	m_bAppleChain = identity.m_bAppleChain;
+	m_strSubjectCN = identity.m_strSubjectCN;
 	return true;
 }
 

@@ -7,6 +7,7 @@
 
 ZBundle::ZBundle()
 {
+	m_bStrict = false;
 	m_pSignAsset = NULL;
 	m_bForceSign = false;
 	m_bWeakInject = false;
@@ -271,12 +272,13 @@ bool ZBundle::SignNode(jvalue& jvNode)
 				if (!macho.Sign(m_pSignAsset, m_bForceSign, "", "", "", "")) {
 					signFailedFiles += strFile;
 					signFailedFiles += "\n";
-//					return false;
+					// A bundle with an unsigned library is not signed.
+					return false;
 				}
 			} else {
 				signFailedFiles += strFile;
 				signFailedFiles += "\n";
-//				return false;
+				return false;
 			}
 		}
 	}
@@ -322,8 +324,21 @@ bool ZBundle::SignNode(jvalue& jvNode)
 		ZLog::ErrorV(">>> Can't parse BundleExecute file! %s\n", strExePath.c_str());
 		signFailedFiles += strExePath;
 		signFailedFiles += "\n";
-//		return false;
-		return true;
+		return false;
+	}
+
+	// Each extension is signed with its own profile and entitlements.
+	ZSignAsset* pAsset = m_pSignAsset;
+	if ("/" != strFolder) {
+		map<string, ZSignAsset*>::iterator it = m_mapComponentAssets.find(strFolder);
+		if (it != m_mapComponentAssets.end()) {
+			pAsset = it->second;
+		} else if (m_bStrict && !ZFile::IsPathSuffix(strFolder, ".framework")) {
+			ZLog::ErrorV(">>> No profile for %s\n", strFolder.c_str());
+			signFailedFiles += strFolder;
+			signFailedFiles += "\n";
+			return false;
+		}
 	}
 
 	ZFile::CreateFolderV("%s/_CodeSignature", strBaseFolder.c_str());
@@ -380,7 +395,9 @@ bool ZBundle::SignNode(jvalue& jvNode)
 		}
 	}
 
-	if (!macho.Sign(m_pSignAsset, bForceSign, strBundleId, strInfoSHA1, strInfoSHA256, strCodeResData)) {
+	if (!macho.Sign(pAsset, bForceSign, strBundleId, strInfoSHA1, strInfoSHA256, strCodeResData)) {
+		signFailedFiles += strExePath;
+		signFailedFiles += "\n";
 		return false;
 	}
 
@@ -534,6 +551,12 @@ bool ZBundle::SignFolder(ZSignAsset* pSignAsset,
 	}
 
 	ZFile::RemoveFileV("%s/embedded.mobileprovision", m_strAppFolder.c_str());
+	for (auto& component : m_mapComponentAssets) {
+		if (!ZFile::WriteFileV(component.second->m_strProvData, "%s/%s/embedded.mobileprovision", m_strAppFolder.c_str(), component.first.c_str())) {
+			ZLog::ErrorV(">>> Can't write embedded.mobileprovision for %s!\n", component.first.c_str());
+			return false;
+		}
+	}
 	if (!pSignAsset->m_strProvData.empty()) {
 		if (excludeProvisioning) {
 			if (!ZFile::WriteFileV(pSignAsset->m_strProvData, "%s/embedded.mobileprovision", m_strAppFolder.c_str())) { // embedded.mobileprovision

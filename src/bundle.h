@@ -3,6 +3,7 @@
 #include "json.h"
 #include "openssl.h"
 #include <vector>
+#include <map>
 
 class ZBundle
 {
@@ -45,4 +46,9 @@ private:
 public:
 	string			m_strAppFolder;
 	string signFailedFiles;
+	// Zag strict signing: extensions by path relative to the app (for
+	// example "PlugIns/Widget.appex"), each with its own profile and
+	// entitlements; any other nested bundle except frameworks is refused.
+	bool						m_bStrict;
+	map<string, ZSignAsset*>	m_mapComponentAssets;
 };
