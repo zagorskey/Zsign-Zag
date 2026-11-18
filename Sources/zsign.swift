@@ -115,6 +115,48 @@ public enum Zsign {
 		}
 		return true
 	}
+	/// Strict signing for Apple Account certificates: the app (`""`) and each
+	/// extension (`"PlugIns/X.appex"`) with its own profile and entitlements.
+	/// The identity is `certificate` (DER) with either `keyData` (PEM, DER or
+	/// PKCS #12, in memory) or `signer`, which signs a PKCS #1 DigestInfo
+	/// (RSA PKCS #1 v1.5) so the private key need not leave its key store.
+	/// Nested apps, App Clips, Watch apps, XPC services and extensions without
+	/// a profile are refused. Every signed binary is verified afterwards.
+	/// - Returns: nil when signed and verified; otherwise why not (the app
+	///   must then be discarded).
+	static public func signComponents(
+		appPath: String,
+		certificate: Data?,
+		keyData: Data? = nil,
+		keyPassword: String = "",
+		signer: ((Data) -> Data?)? = nil,
+		components: [String: (provision: Data, entitlements: Data)],
+		bundleIdentifier: String? = nil,
+		extraIntermediates: [Data] = []
+	) -> String? {
+		var error: NSString?
+		let input = components.mapValues { ["provision": $0.provision, "entitlements": $0.entitlements] as [String: Data] }
+		let ok = ZagSignComponents(
+			appPath, certificate, keyData, keyPassword,
+			signer.map { sign in { digestInfo in digestInfo.flatMap(sign) } },
+			input, bundleIdentifier, extraIntermediates, &error
+		)
+		return ok ? nil : (error as String? ?? "Signing failed.")
+	}
+
+	/// Re-checks an app signed by `signComponents`, without changing it:
+	/// every binary's signature, code hashes, team, identifiers, entitlements
+	/// and embedded profiles. Returns nil when it verifies.
+	static public func verifyComponents(
+		appPath: String,
+		certificate: Data,
+		components: [String: (provision: Data, entitlements: Data)]
+	) -> String? {
+		var error: NSString?
+		let input = components.mapValues { ["provision": $0.provision, "entitlements": $0.entitlements] as [String: Data] }
+		return ZagVerifyComponents(appPath, certificate, input, &error) ? nil : (error as String? ?? "Not verified.")
+	}
+
 	/// Check revokage
 	/// - Parameters:
 	///   - provisionPath: Relative path to a provisioning file (i.e. `samara.mobileprovision`)

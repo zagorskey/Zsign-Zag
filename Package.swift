@@ -43,6 +43,7 @@ let package = Package(
 				"openssl.cpp",
 				"openssl_tools.mm",
 				"signing.cpp",
+				"zag_components.cpp",
 				"zsign.mm",
 				"common/base64.cpp",
 				"common/fs.cpp",
